@@ -1,0 +1,7 @@
+*.assert
+*.snap
+parts/
+stage/
+prime/
+
+*.swp

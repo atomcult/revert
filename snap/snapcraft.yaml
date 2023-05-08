@@ -1,0 +1,37 @@
+name: revert
+base: core22
+adopt-info: revert
+summary: Really Easy Validate, Ensure, \& Refresh Tool
+description: |
+  This is my-snap's description. You have a paragraph or two to tell the
+  most important story about your snap. Keep it under 100 words though,
+  we live in tweetspace and your description wants to look good in the snap
+  store.
+
+grade: devel
+confinement: devmode
+
+apps:
+  revert:
+    command: revert
+  yq:
+    command: bin/yq
+
+parts:
+  revert:
+    plugin: dump
+    source: ./
+    override-build: |
+      craftctl default
+      craftctl set version="$(./revert --version | cut -dv -f3)"
+    stage:
+      - revert
+    prime:
+      - revert
+  yq:
+    plugin: nil
+    stage-snaps:
+      - yq
+    override-prime: |
+      craftctl default
+      strip -s ${CRAFT_PRIME}/bin/yq

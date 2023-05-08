@@ -1,0 +1,290 @@
+#!/bin/sh -eu
+
+readonly _PROG_NAME="revert"
+readonly _SEMVER="0.1.0"
+readonly _DEPENDENCIES="snap:yq"
+
+_OPT_FILE=""
+_OPT_TARGET_DIR="./"
+_OPT_MODE=""
+
+_OPT_ENSURE="refresh"
+
+_SNAP_LIST="$(snap list)"
+
+readonly _term_reset="\033[m"
+readonly _term_bold="\033[1m"
+readonly _term_fg_cyan="\033[36m"
+
+print_version() echo "${_PROG_NAME} v${_SEMVER}"
+
+print_usage() cat <<EOF
+
+USAGE: ${_PROG_NAME} [OPTIONS..]
+
+MODES:
+  -C, --compare-revs
+  -B, --backup
+  -E, --ensure
+
+COMMON OPTIONS:
+  -f, --file FILE
+  -t, --target DIR
+  -h, --help
+  -V, --version
+      --health
+
+ENSURE OPTIONS:
+  --only-download
+  --only-ack
+EOF
+
+print_help() {
+    print_version
+    echo "Really Easy Validate, Ensure, & Refresh Tool"
+    print_usage
+}
+
+inspect_var() {
+    local _var_name="$1"
+
+    local _max_chars="35"
+
+    local _shopts="$-"; set +u
+    local _var_content="$(eval echo "\$$_var_name")"
+    set "+$-"; set "-${_shopts}"
+
+    [ "${#_var_content}" -le "$_max_chars" ] || \
+        _var_content="$(get_first_n_chars $((_max_chars-3)) "$_var_content")..."
+
+    printf "%-33s= %s\n" "$_var_name" "'$_var_content'"
+}
+
+check_health() {
+    local _prev_ifs="$IFS"
+    IFS=:
+
+    echo "${_term_bold}${_term_fg_cyan}Dependencies:${_term_reset}"
+    for _prog in $_DEPENDENCIES; do
+        local _path="$(command -v "$_prog" || true)"
+        printf "%-10s%s\n" "${_prog}" "${_path:-NOT FOUND}"
+    done
+
+    local _vars="UBUNTU_STORE_URL:UBUNTU_STORE_ID:UBUNTU_STORE_AUTH:UBUNTU_STORE_AUTH_DATA_FILENAME"
+    echo
+    echo "${_term_bold}${_term_fg_cyan}Environment:${_term_reset}"
+    for _var in $_vars; do
+        inspect_var "$_var"
+    done
+    IFS="$_prev_ifs"
+}
+
+err() printf 'ERROR:\n  %s' "$*"
+
+get_first_n_chars() {
+    local _n_chars="$1"
+    local _str="$2"
+
+    local _head=""
+    while [ "${#_head}" -ne "$_n_chars" ] && [ -n "$_str" ]; do
+        local _tail="${_str#?}"
+        local _first="${_str%"$_tail"}"
+        _str="$_tail"
+
+        _head="${_head}${_first}"
+    done
+
+    echo "$_head"
+}
+
+read_assertion() {
+    local _assert_file="$1"
+
+    local _prev_ifs="$IFS"
+    IFS='|' # Prevent read from stripping leading spaces
+
+    while read -r _line; do
+        [ -n "$_line" ] || break
+        echo "$_line"
+    done < "$_assert_file"
+
+    IFS="$_prev_ifs"
+}
+
+download_snap() {
+    local _id="$1"
+    local _name="$2"
+    local _presence="$3"
+    local _revision="$4"
+
+    local _file_stem="${_name}_${_revision}"
+    if [ -f "${_file_stem}.snap" ] && [ -f "${_file_stem}.assert" ]; then
+        echo "Skipping download: ${_name}@${_revision}..."
+        return
+    fi
+
+    snap download --revision="$_revision" "$_name"
+}
+
+ack_assertion() {
+    local _id="$1"
+    local _name="$2"
+    local _presence="$3"
+    local _revision="$4"
+
+    local _assert_path="${_name}_${_revision}.assert"
+    echo "Acking: ${PWD}/${_assert_path}"
+    sudo snap ack "$_assert_path"
+}
+
+collect() {
+    local _id="$1"
+    local _name="$2"
+    local _presence="$3"
+    local _revision="$4"
+
+    echo -n "${_name}_${_revision}.snap "
+}
+
+generate_assertion() {
+    echo "snaps:"
+    echo "$_SNAP_LIST" | while read -r _snap_name _snap_version _snap_revision _snap_channel _snap_publisher; do
+        [ "$_snap_name" = "Name" ] && continue
+
+        local _snap_id='none'
+
+        if [ "${_snap_revision%"${_snap_revision#?}"}" != "x" ]; then
+            _snap_id="$(snap info "$_snap_name" | yq -r .snap-id)"
+        fi
+
+        echo "  -"
+        echo "    id: ${_snap_id}"
+        echo "    name: ${_snap_name}"
+        echo "    presence: required"
+        echo "    revision: ${_snap_revision}"
+    done
+}
+
+for_each_snap() {
+    local _func="$1"
+
+    local _prev_ifs="$IFS"
+    IFS=","
+
+    yq -o csv '.snaps[] | [.id, .name, .presence, .revision]' | \
+        while read -r _id _name _presence _revision; do
+            IFS="$_prev_ifs" \
+            "$_func" "$_id" "$_name" "$_presence" "$_revision"
+        done
+
+    IFS="$_prev_ifs"
+}
+
+compare_revisions() {
+    local _snap_name="$2"
+
+    local _version_str="$(echo "$_SNAP_LIST" | grep "^${_snap_name} ")"
+
+    if [ -z "$_version_str" ]; then
+        printf "%-30s %6s --> %6s\n" "$_snap_name" "n/a" "$_revision"
+        return
+    fi
+
+    echo "$_version_str" | while read -r _name _version _cur_revision _channel _publisher; do
+        printf "%-30s %6s" "$_snap_name" "$_cur_revision"
+        [ "$_cur_revision" = "$_revision" ] || printf " --> %6s" "$_revision"
+        echo
+    done
+}
+
+parse() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -h | --help)
+                print_help
+                exit 0
+                ;;
+            -V | --version)
+                print_version
+                exit 0
+                ;;
+            --health)
+                check_health
+                exit 0
+                ;;
+            -f | --file)
+                _OPT_FILE="$2"
+                [ -e "$_OPT_FILE" ] || ( err "No such file: '${_OPT_FILE}'" && exit 1 )
+                shift
+                ;;
+            -t | --target)
+                _OPT_TARGET_DIR="$2"
+                [ -e "$_OPT_TARGET_DIR" ] || mkdir -p "$_OPT_TARGET_DIR"
+                shift
+                ;;
+            -C | --compare-revs)
+                [ -z "$_OPT_MODE" ] || ( err "--compare-revs is incompatible with --${_OPT_MODE}" && exit 1 )
+                _OPT_MODE="compare-revs"
+                ;;
+            -B | --backup)
+                [ -z "$_OPT_MODE" ] || ( err "--backup is incompatible with --${_OPT_MODE}" && exit 1 )
+                _OPT_MODE="backup"
+                ;;
+            -E | --enforce)
+                [ -z "$_OPT_MODE" ] || ( err "--enforce is incompatible with --${_OPT_MODE}" && exit 1 )
+                _OPT_MODE="enforce"
+                ;;
+            --only-download)
+                _OPT_ENSURE="download"
+                ;;
+            --only-ack)
+                _OPT_ENSURE="ack"
+                ;;
+            *)
+                err "Unknown option: '$1'"
+                print_usage
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
+check_sanity() {
+    # TODO: Make sure that the combination of flags makes sense
+    :
+}
+
+main() {
+    parse "$@"
+    check_sanity
+
+    case "$_OPT_MODE" in
+        backup)
+            generate_assertion
+            ;;
+        compare-revs)
+            read_assertion "$_OPT_FILE" | for_each_snap compare_revisions
+            ;;
+        enforce)
+            local _assert="$(read_assertion "$_OPT_FILE")"
+
+            cd "$_OPT_TARGET_DIR"
+
+            echo "$_assert" | for_each_snap download_snap
+            [ ! "$_OPT_ENSURE" = "download" ] || return
+
+            echo "$_assert" | for_each_snap ack_assertion
+            [ ! "$_OPT_ENSURE" = "ack" ] || return
+
+            local _snaps="$(echo "$_assert" | for_each_snap collect)"
+            echo "sudo snap install --transaction=all-snaps $_snaps"
+            ;;
+        *)
+            print_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
